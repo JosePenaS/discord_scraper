@@ -1,4 +1,4 @@
-name: Discord scrape → Supabase
+name: "Discord scrape → Supabase"
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ jobs:
           --shm-size=2g
 
     env:
-      # ---- required (set these in repo Settings → Secrets and variables → Actions) ----
+      # ---- required (set in Settings → Secrets and variables → Actions) ----
       DISCORD_CHANNEL_URL: ${{ vars.DISCORD_CHANNEL_URL }}
       DISCORD_EMAIL:       ${{ secrets.DISCORD_EMAIL }}
       DISCORD_PASSWORD:    ${{ secrets.DISCORD_PASSWORD }}
@@ -58,7 +58,7 @@ jobs:
           ), repos="https://cloud.r-project.org")'
 
       - name: Run scraper
-        run: Rscript scripts/discord_scrape.R
+        run: Rscript discord_scrape.R
 
       - name: Upload artifacts (CSV snapshots)
         if: always()
@@ -66,3 +66,5 @@ jobs:
         with:
           name: discord-scrape-artifacts
           path: artifacts/
+          if-no-files-found: warn
+
