@@ -57,6 +57,19 @@ jobs:
             "DBI","RPostgres","readr","glue"
           ), repos="https://cloud.r-project.org")'
 
+      - name: Wait for Selenium to be ready
+        run: |
+          for i in {1..30}; do
+            if curl -sSf http://localhost:4444/wd/hub/status >/dev/null 2>&1 || \
+               curl -sSf http://localhost:4444/status >/dev/null 2>&1; then
+              echo "Selenium is up"; exit 0
+            fi
+            echo "Waiting for Selenium... ($i)"
+            sleep 2
+          done
+          echo "Selenium failed to start"
+          exit 1
+
       - name: Run scraper
         run: Rscript discord_scrape.R
 
@@ -67,4 +80,3 @@ jobs:
           name: discord-scrape-artifacts
           path: artifacts/
           if-no-files-found: warn
-
