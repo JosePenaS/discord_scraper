@@ -1,10 +1,8 @@
 #!/usr/bin/env Rscript
-# CI-friendly Discord scraper → Supabase
-# - Connects to Selenium service at localhost:4444 (robust path handling)
-# - Logs into Discord (env creds)
-# - Scrolls channel and captures messages
-# - Parses & upserts into Supabase
-# - Writes CSV artifacts for debugging
+# CI-friendly Discord scraper → Supabase (hardened)
+# - Realistic Chrome caps (UA, window-size, automation flags)
+# - Robust waits + debug artifacts (HTML + PNG)
+# - Cloudflare/hCaptcha detection with clear failure
 
 suppressPackageStartupMessages({
   library(RSelenium)
@@ -22,12 +20,25 @@ suppressPackageStartupMessages({
 # --- harden networking in CI (avoid odd proxies) ---
 Sys.unsetenv(c("http_proxy","https_proxy","HTTP_PROXY","HTTPS_PROXY"))
 
+dir.create("artifacts", showWarnings = FALSE)
+
 # ---------- helpers ----------
 getv <- function(name, default = NULL, required = FALSE) {
   v <- Sys.getenv(name, unset = NA_character_)
   if (!is.na(v) && nzchar(v)) return(v)
   if (required) stop(glue("Missing required environment variable: {name}"), call. = FALSE)
   default
+}
+
+wait_dom_ready <- function(remDr, timeout = 20000, interval = 250) {
+  deadline <- Sys.time() + timeout/1000
+  repeat {
+    state <- tryCatch(remDr$executeScript("return document.readyState")[[1]],
+                      error = function(e) "") 
+    if (identical(state, "complete")) return(invisible(TRUE))
+    if (Sys.time() > deadline) stop("Timeout waiting for DOM readyState=complete")
+    Sys.sleep(interval/1000)
+  }
 }
 
 wait_css <- function(remDr, css, timeout = 15000, interval = 500) {
@@ -40,9 +51,42 @@ wait_css <- function(remDr, css, timeout = 15000, interval = 500) {
   }
 }
 
+wait_any_css <- function(remDr, css_list, timeout = 15000, interval = 400) {
+  deadline <- Sys.time() + timeout/1000
+  repeat {
+    for (css in css_list) {
+      el <- tryCatch(remDr$findElement("css selector", css), error = function(e) NULL)
+      if (!is.null(el)) return(list(css = css, element = el))
+    }
+    if (Sys.time() > deadline) return(NULL)
+    Sys.sleep(interval/1000)
+  }
+}
+
+save_debug <- function(remDr, stem) {
+  # Save HTML + screenshot to artifacts
+  html <- tryCatch(remDr$getPageSource()[[1]], error = function(e) "")
+  if (nzchar(html)) writeLines(html, file.path("artifacts", paste0(stem, ".html")))
+  try(remDr$screenshot(file = file.path("artifacts", paste0(stem, ".png"))), silent = TRUE)
+}
+
+# ---------- Selenium open (with realistic caps) ----------
 open_selenium <- function() {
   message("🔌 Connecting to Selenium at localhost:4444 ...")
-  # Try Selenium 3-style endpoint first, then Selenium 4 root
+  ua <- "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+  caps <- list(
+    "goog:chromeOptions" = list(
+      args = c(
+        "--headless=new",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--window-size=1366,768",
+        "--disable-blink-features=AutomationControlled",
+        "--lang=en-US,en",
+        glue("--user-agent={ua}")
+      )
+    )
+  )
   for (pth in c("/wd/hub", "")) {
     pth_msg <- if (pth == "") "/" else pth
     message(sprintf("… trying path '%s'", pth_msg))
@@ -50,7 +94,8 @@ open_selenium <- function() {
       remoteServerAddr = "localhost",
       port             = 4444L,
       browserName      = "chrome",
-      path             = pth    # IMPORTANT: include leading slash for wd/hub
+      path             = pth,
+      extraCapabilities = caps
     )
     ok <- tryCatch({ drv$open(); TRUE }, error = function(e) {
       message("   failed: ", conditionMessage(e)); FALSE
@@ -65,10 +110,10 @@ CHANNEL_URL      <- getv("DISCORD_CHANNEL_URL", required = TRUE)
 DISCORD_EMAIL    <- getv("DISCORD_EMAIL", required = TRUE)
 DISCORD_PASSWORD <- getv("DISCORD_PASSWORD", required = TRUE)
 
-N_SCROLLS        <- as.integer(getv("N_SCROLLS", "600"))        # iterations
-SCROLL_PX        <- as.integer(getv("SCROLL_PX", "-800"))       # pixel delta per scroll (negative = up)
-SCROLL_SLEEP_MS  <- as.integer(getv("SCROLL_SLEEP_MS", "1200")) # pause after each scroll
-TIMEOUT_MS       <- as.integer(getv("TIMEOUT_MS", "15000"))     # waits for elements
+N_SCROLLS        <- as.integer(getv("N_SCROLLS", "600"))
+SCROLL_PX        <- as.integer(getv("SCROLL_PX", "-800"))
+SCROLL_SLEEP_MS  <- as.integer(getv("SCROLL_SLEEP_MS", "1200"))
+TIMEOUT_MS       <- as.integer(getv("TIMEOUT_MS", "15000"))
 
 # Supabase
 SB_HOST <- getv("SUPABASE_HOST", required = TRUE)
@@ -77,56 +122,82 @@ SB_DB   <- getv("SUPABASE_DB", required = TRUE)
 SB_USER <- getv("SUPABASE_USER", required = TRUE)
 SB_PWD  <- getv("SUPABASE_PWD", required = TRUE)
 
-# ---------- connect to Selenium (service container) ----------
+# ---------- connect ----------
 remDr <- open_selenium()
 
 # ---------- login flow ----------
 message("➡️  Navigating to Discord login...")
 remDr$navigate("https://discord.com/login")
+wait_dom_ready(remDr, 25000)
+save_debug(remDr, "login_after_nav")
 
-# Dismiss cookie banner if any (best-effort)
+# Detect common challenge/blocks BEFORE looking for inputs
+title_now <- tryCatch(remDr$getTitle()[[1]], error = function(e) "")
+page_src  <- tryCatch(remDr$getPageSource()[[1]], error = function(e) "")
+blocked <- grepl("Just a moment|Access denied|Attention Required|blocked", title_now, ignore.case = TRUE) ||
+           grepl("captcha|cf-error|challenge", page_src, ignore.case = TRUE)
+
+if (blocked) {
+  save_debug(remDr, "blocked_login")
+  stop("Discord/Cloudflare challenge detected (captcha or access block). See artifacts/blocked_login.*", call. = FALSE)
+}
+
+# Cookie consent (best-effort)
 try({
   btns <- remDr$findElements("css selector", "button, [role='button']")
-  if (length(btns)) {
-    for (b in btns) {
-      txt <- tryCatch(b$getElementText()[[1]], error = function(e) "")
-      if (grepl("Accept|Allow|Aceptar|Agree", txt, ignore.case = TRUE)) { b$clickElement(); break }
-    }
+  for (b in btns) {
+    txt <- tryCatch(b$getElementText()[[1]], error = function(e) "")
+    if (grepl("Accept|Allow|Aceptar|Agree", txt, ignore.case = TRUE)) { b$clickElement(); break }
   }
 }, silent = TRUE)
 
-# Fill credentials
-email_box <- wait_css(remDr, "input[name='email'], input[type='email']", TIMEOUT_MS)
+# Try to locate the login form OR any block indicator
+first_hit <- wait_any_css(
+  remDr,
+  css_list = c(
+    "input[name='email'], input[type='email']",
+    "div#challenge-stage",
+    "iframe[src*='captcha'], iframe[title*='captcha']"
+  ),
+  timeout = TIMEOUT_MS
+)
+
+if (is.null(first_hit) || !grepl("input", first_hit$css, fixed = TRUE)) {
+  save_debug(remDr, "no_email_input")
+  stop("Login form not found (possibly blocked or layout changed). See artifacts/no_email_input.*", call. = FALSE)
+}
+
+email_box <- first_hit$element
 pwd_box   <- wait_css(remDr, "input[name='password'], input[type='password']", TIMEOUT_MS)
+
 email_box$clearElement(); email_box$sendKeysToElement(list(DISCORD_EMAIL))
 pwd_box$clearElement();   pwd_box$sendKeysToElement(list(DISCORD_PASSWORD))
 
-# Submit
 login_btn <- wait_css(remDr, "button[type='submit']", TIMEOUT_MS)
 login_btn$clickElement()
 
 # Wait for app shell (servers sidebar)
-message("⏳ Waiting for app UI...")
+message("⏳ Waiting for app UI…")
 ok <- FALSE
-deadline <- Sys.time() + 25
+deadline <- Sys.time() + 30
 repeat {
   els <- remDr$findElements("css selector", "[data-list-id='guildsnav'], nav[aria-label='Servers']")
   if (length(els) > 0) { ok <- TRUE; break }
   if (Sys.time() > deadline) break
   Sys.sleep(0.5)
 }
-if (!ok) stop("Login did not complete (captcha/2FA or selector changed).", call. = FALSE)
+save_debug(remDr, if (ok) "after_login_ok" else "after_login_failed")
+if (!ok) stop("Login did not complete (captcha/2FA or selector changed). See artifacts/after_login_failed.*", call. = FALSE)
 
 # Go to target channel
-message("➡️  Opening target channel...")
+message("➡️  Opening target channel…")
 remDr$navigate(CHANNEL_URL)
+wait_dom_ready(remDr, 20000)
+save_debug(remDr, "channel_after_nav")
 
 # ---------- scrolling & capture ----------
-# You fully control the distance with SCROLL_PX in pixels.
-message(glue("🖱️  Scrolling {N_SCROLLS} iterations, step {SCROLL_PX}px, delay {SCROLL_SLEEP_MS}ms..."))
-
-# NOTE: CSS classes can drift; update if needed.
-SCROLLER_CSS <- ".managedReactiveScroller_d125d2"
+message(glue("🖱️  Scrolling {N_SCROLLS} iterations, step {SCROLL_PX}px, delay {SCROLL_SLEEP_MS}ms…"))
+SCROLLER_CSS <- ".managedReactiveScroller_d125d2"    # may drift over time
 MSG_LI_CSS   <- "li.messageListItem__5126c"
 
 df_containers_all <- tibble(container_html = character())
@@ -144,14 +215,14 @@ for (i in seq_len(N_SCROLLS)) {
     df_containers_all <- bind_rows(df_containers_all, tibble(container_html = raw_vec))
   }
 
-  remDr$executeScript("arguments[0].scrollBy(0, arguments[1]);",
-                      list(scroller, SCROLL_PX))
+  remDr$executeScript("arguments[0].scrollBy(0, arguments[1]);", list(scroller, SCROLL_PX))
   Sys.sleep(SCROLL_SLEEP_MS/1000)
 }
 
 # Deduplicate
 df_containers_all <- df_containers_all %>% distinct(container_html, .keep_all = TRUE)
 message(glue("📦 Captured unique containers: {nrow(df_containers_all)}"))
+write_csv(df_containers_all, "artifacts/df_containers_all.csv")
 
 # ---------- parsing ----------
 parseDiscordMessage <- function(html_snippet) {
@@ -169,9 +240,7 @@ parseDiscordMessage <- function(html_snippet) {
     if (!is.na(tmp_snippet)) reply_snippet <- tmp_snippet
   }
 
-  poster_user <- doc %>%
-    html_node("span.headerText_c19a55 span.username_c19a55") %>%
-    html_text(trim = TRUE)
+  poster_user <- doc %>% html_node("span.headerText_c19a55 span.username_c19a55") %>% html_text(trim = TRUE)
   if (is.na(poster_user)) poster_user <- NA_character_
 
   time_node <- doc %>% html_node("span.timestamp_c19a55 time")
@@ -199,26 +268,17 @@ parseDiscordMessage <- function(html_snippet) {
   )
 }
 
-clean_df <- df_containers_all %>%
-  filter(!is.na(container_html) & nzchar(container_html))
-
-parsed_list <- lapply(clean_df$container_html, parseDiscordMessage)
-df_parsed <- bind_rows(parsed_list)
-
-# backfill poster_user when Discord omits repeats
+clean_df <- df_containers_all %>% filter(!is.na(container_html) & nzchar(container_html))
+df_parsed <- bind_rows(lapply(clean_df$container_html, parseDiscordMessage))
 df_parsed <- df_parsed %>% tidyr::fill(poster_user, .direction = "down")
-
-# optional: write artifacts for debugging
-dir.create("artifacts", showWarnings = FALSE)
-write_csv(df_containers_all, "artifacts/df_containers_all.csv")
-write_csv(df_parsed,        "artifacts/df_parsed.csv")
+write_csv(df_parsed, "artifacts/df_parsed.csv")
 
 # ---------- upload to Supabase ----------
-message("🛫 Uploading to Supabase...")
+message("🛫 Uploading to Supabase…")
 
 df_upload <- df_parsed %>%
   mutate(
-    msg_id   = row_number(),                          # run-local PK fallback
+    msg_id   = row_number(),
     time_iso = suppressWarnings(ymd_hms(time_iso, tz = "UTC"))
   ) %>%
   select(msg_id, poster_user, time_text, time_iso, message_text, is_reply, reply_user, reply_snippet)
@@ -265,4 +325,5 @@ DBI::dbExecute(con, "
 DBI::dbExecute(con, "DROP TABLE IF EXISTS tmp_discord_messages;")
 
 message("✅ Done. Uploaded rows: ", nrow(df_upload))
+
 
