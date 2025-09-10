@@ -1,8 +1,5 @@
 #!/usr/bin/env Rscript
-# CI-friendly Discord scraper → Supabase (hardened)
-# - Realistic Chrome caps (UA, window-size, automation flags)
-# - Robust waits + debug artifacts (HTML + PNG)
-# - Cloudflare/hCaptcha detection with clear failure
+# CI-friendly Discord scraper → Supabase (hardened, no readyState waits)
 
 suppressPackageStartupMessages({
   library(RSelenium)
@@ -30,17 +27,6 @@ getv <- function(name, default = NULL, required = FALSE) {
   default
 }
 
-wait_dom_ready <- function(remDr, timeout = 20000, interval = 250) {
-  deadline <- Sys.time() + timeout/1000
-  repeat {
-    state <- tryCatch(remDr$executeScript("return document.readyState")[[1]],
-                      error = function(e) "") 
-    if (identical(state, "complete")) return(invisible(TRUE))
-    if (Sys.time() > deadline) stop("Timeout waiting for DOM readyState=complete")
-    Sys.sleep(interval/1000)
-  }
-}
-
 wait_css <- function(remDr, css, timeout = 15000, interval = 500) {
   deadline <- Sys.time() + timeout/1000
   repeat {
@@ -64,20 +50,25 @@ wait_any_css <- function(remDr, css_list, timeout = 15000, interval = 400) {
 }
 
 save_debug <- function(remDr, stem) {
-  # Save HTML + screenshot to artifacts
   html <- tryCatch(remDr$getPageSource()[[1]], error = function(e) "")
   if (nzchar(html)) writeLines(html, file.path("artifacts", paste0(stem, ".html")))
   try(remDr$screenshot(file = file.path("artifacts", paste0(stem, ".png"))), silent = TRUE)
 }
 
-# ---------- Selenium open (with realistic caps) ----------
+switch_to_latest_window <- function(remDr) {
+  h <- tryCatch(remDr$getWindowHandles()[[1]], error = function(e) character())
+  if (length(h) > 0) try(remDr$switchToWindow(h[[length(h)]]), silent = TRUE)
+}
+
+# ---------- Selenium open (realistic caps; no --headless=new) ----------
 open_selenium <- function() {
   message("🔌 Connecting to Selenium at localhost:4444 ...")
   ua <- "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
   caps <- list(
     "goog:chromeOptions" = list(
       args = c(
-        "--headless=new",
+        # The standalone-chrome container already runs with a virtual display,
+        # so we don't *need* headless. If you insist, add "--headless".
         "--no-sandbox",
         "--disable-dev-shm-usage",
         "--window-size=1366,768",
@@ -85,7 +76,8 @@ open_selenium <- function() {
         "--lang=en-US,en",
         glue("--user-agent={ua}")
       )
-    )
+    ),
+    "pageLoadStrategy" = "eager"  # don't block on full load
   )
   for (pth in c("/wd/hub", "")) {
     pth_msg <- if (pth == "") "/" else pth
@@ -126,21 +118,10 @@ SB_PWD  <- getv("SUPABASE_PWD", required = TRUE)
 remDr <- open_selenium()
 
 # ---------- login flow ----------
-message("➡️  Navigating to Discord login...")
+message("➡️  Navigating to Discord login…")
 remDr$navigate("https://discord.com/login")
-wait_dom_ready(remDr, 25000)
+switch_to_latest_window(remDr)
 save_debug(remDr, "login_after_nav")
-
-# Detect common challenge/blocks BEFORE looking for inputs
-title_now <- tryCatch(remDr$getTitle()[[1]], error = function(e) "")
-page_src  <- tryCatch(remDr$getPageSource()[[1]], error = function(e) "")
-blocked <- grepl("Just a moment|Access denied|Attention Required|blocked", title_now, ignore.case = TRUE) ||
-           grepl("captcha|cf-error|challenge", page_src, ignore.case = TRUE)
-
-if (blocked) {
-  save_debug(remDr, "blocked_login")
-  stop("Discord/Cloudflare challenge detected (captcha or access block). See artifacts/blocked_login.*", call. = FALSE)
-}
 
 # Cookie consent (best-effort)
 try({
@@ -151,20 +132,21 @@ try({
   }
 }, silent = TRUE)
 
-# Try to locate the login form OR any block indicator
+# Look for either the login inputs OR obvious challenge markers
 first_hit <- wait_any_css(
   remDr,
   css_list = c(
     "input[name='email'], input[type='email']",
     "div#challenge-stage",
-    "iframe[src*='captcha'], iframe[title*='captcha']"
+    "iframe[src*='captcha'], iframe[title*='captcha']",
+    "#app-mount"  # Discord root (as a last resort indicator page rendered)
   ),
-  timeout = TIMEOUT_MS
+  timeout = TIMEOUT_MS * 2
 )
 
 if (is.null(first_hit) || !grepl("input", first_hit$css, fixed = TRUE)) {
   save_debug(remDr, "no_email_input")
-  stop("Login form not found (possibly blocked or layout changed). See artifacts/no_email_input.*", call. = FALSE)
+  stop("Login form not found (maybe Cloudflare/captcha or layout change). See artifacts/no_email_input.*", call. = FALSE)
 }
 
 email_box <- first_hit$element
@@ -183,8 +165,8 @@ deadline <- Sys.time() + 30
 repeat {
   els <- remDr$findElements("css selector", "[data-list-id='guildsnav'], nav[aria-label='Servers']")
   if (length(els) > 0) { ok <- TRUE; break }
-  if (Sys.time() > deadline) break
   Sys.sleep(0.5)
+  if (Sys.time() > deadline) break
 }
 save_debug(remDr, if (ok) "after_login_ok" else "after_login_failed")
 if (!ok) stop("Login did not complete (captcha/2FA or selector changed). See artifacts/after_login_failed.*", call. = FALSE)
@@ -192,7 +174,7 @@ if (!ok) stop("Login did not complete (captcha/2FA or selector changed). See art
 # Go to target channel
 message("➡️  Opening target channel…")
 remDr$navigate(CHANNEL_URL)
-wait_dom_ready(remDr, 20000)
+switch_to_latest_window(remDr)
 save_debug(remDr, "channel_after_nav")
 
 # ---------- scrolling & capture ----------
@@ -325,5 +307,3 @@ DBI::dbExecute(con, "
 DBI::dbExecute(con, "DROP TABLE IF EXISTS tmp_discord_messages;")
 
 message("✅ Done. Uploaded rows: ", nrow(df_upload))
-
-
