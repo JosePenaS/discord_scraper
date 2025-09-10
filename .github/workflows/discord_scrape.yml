@@ -1,28 +1,19 @@
-name: "Discord scrape → Supabase"
+name: "Discord scrape (Bot API) → Supabase"
 
 on:
   workflow_dispatch:
   schedule:
-    # Runs daily at 12:00 UTC (~09:00 America/Santiago when UTC-3)
+    # Daily at 12:00 UTC (~09:00 America/Santiago when UTC-3)
     - cron: "0 12 * * *"
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
 
-    services:
-      selenium:
-        image: selenium/standalone-chrome:latest
-        ports:
-          - 4444:4444
-        options: >-
-          --shm-size=2g
-
     env:
-      # ---- required (set in Settings → Secrets and variables → Actions) ----
-      DISCORD_CHANNEL_URL: ${{ vars.DISCORD_CHANNEL_URL }}
-      DISCORD_EMAIL:       ${{ secrets.DISCORD_EMAIL }}
-      DISCORD_PASSWORD:    ${{ secrets.DISCORD_PASSWORD }}
+      # ---- required secrets/vars ----
+      DISCORD_CHANNEL_ID: ${{ vars.DISCORD_CHANNEL_ID }}
+      DISCORD_BOT_TOKEN:  ${{ secrets.DISCORD_BOT_TOKEN }}
 
       SUPABASE_HOST: ${{ secrets.SUPABASE_HOST }}
       SUPABASE_PORT: ${{ secrets.SUPABASE_PORT }}
@@ -30,11 +21,8 @@ jobs:
       SUPABASE_USER: ${{ secrets.SUPABASE_USER }}
       SUPABASE_PWD:  ${{ secrets.SUPABASE_PWD }}
 
-      # ---- optional tuning (safe as repo VARs) ----
-      N_SCROLLS:        ${{ vars.N_SCROLLS }}
-      SCROLL_PX:        ${{ vars.SCROLL_PX }}
-      SCROLL_SLEEP_MS:  ${{ vars.SCROLL_SLEEP_MS }}
-      TIMEOUT_MS:       ${{ vars.TIMEOUT_MS }}
+      # ---- optional tuning ----
+      MAX_MESSAGES:  ${{ vars.MAX_MESSAGES }}
 
     steps:
       - name: Checkout repo
@@ -53,30 +41,18 @@ jobs:
       - name: Install R packages
         run: |
           Rscript -e 'install.packages(c(
-            "RSelenium","rvest","stringr","dplyr","tidyr","lubridate",
-            "DBI","RPostgres","readr","glue"
+            "httr2","dplyr","purrr","tidyr","lubridate","readr",
+            "DBI","RPostgres","glue"
           ), repos="https://cloud.r-project.org")'
 
-      - name: Wait for Selenium to be ready
-        run: |
-          for i in {1..30}; do
-            if curl -sSf http://localhost:4444/wd/hub/status >/dev/null 2>&1 || \
-               curl -sSf http://localhost:4444/status >/dev/null 2>&1; then
-              echo "Selenium is up"; exit 0
-            fi
-            echo "Waiting for Selenium... ($i)"
-            sleep 2
-          done
-          echo "Selenium failed to start"
-          exit 1
+      - name: Run scraper (Bot API)
+        run: Rscript discord_bot_scrape.R
 
-      - name: Run scraper
-        run: Rscript discord_scrape.R
-
-      - name: Upload artifacts (CSV snapshots)
+      - name: Upload artifacts (CSV snapshot)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: discord-scrape-artifacts
+          name: discord-bot-scrape-artifacts
           path: artifacts/
           if-no-files-found: warn
+
